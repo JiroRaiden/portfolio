@@ -306,19 +306,10 @@ main { position: relative; z-index: 1; }
 .t-cyan { color: var(--cyan); }
 .t-cream { color: var(--cream); }
 
-/* ============ Works: pinned horizontal scroll ============ */
-/* The section's height is set by JS (screen height + how far the row travels).
-   The pin panel inside it sticks to the top of the screen for that whole distance. */
-.chapter--works { padding: 0; min-height: 0; }
-.works-pin {
-  position: sticky;
-  top: 0;
-  height: 100vh;
-  padding: 112px 0 40px var(--content-left);
-  display: flex;
-  flex-direction: column;
-  overflow: hidden;
-}
+/* ============ Works: an endless, drifting row of cards ============ */
+/* A normal section (no pinning): the page scrolls straight past it.
+   The row moves by itself; JS handles dragging and sideways scrolling. */
+.chapter--works { padding-left: var(--content-left); padding-right: 0; overflow-x: clip; }
 .chapter--works .chapter-head { padding-right: var(--gutter); }
 .works__hints {
   margin: 0 0 12px;
@@ -336,28 +327,37 @@ main { position: relative; z-index: 1; }
    starts. Both ends fade out with a mask: on the left, cards dissolve before they
    reach the chapter menu; on the right, they don't get cut off sharply. */
 .works-viewport {
-  flex: 1;
-  min-height: 0;
-  display: flex;
-  align-items: center;
+  height: clamp(440px, 60vh, 580px);
   margin: 8px 0 0 calc(-1 * var(--content-left));
   /* Room above and below so a hovered card can grow without being clipped.
      (The fade mask only draws inside this box, so anything outside it vanishes.) */
   padding: 24px 0;
+  overflow: clip;              /* clip, not hidden: nothing here may scroll by itself */
+  touch-action: pan-y;         /* phones: vertical swipes scroll the page, sideways ones move the row */
+  user-select: none;
   --fade-left: linear-gradient(90deg, transparent 0, transparent calc(var(--content-left) - 90px), #000 calc(var(--content-left) - 10px), #000 calc(100% - 80px), transparent 100%);
   -webkit-mask-image: var(--fade-left);
   mask-image: var(--fade-left);
 }
+.works-viewport.is-dragging, .works-viewport.is-dragging .wcard { cursor: grabbing; }
 .wtrack {
   display: flex;
-  gap: 36px;
   width: max-content;
-  /* Extra space after the last card, so it can come to rest away from the edge. */
-  padding: 0 var(--gutter) 0 calc(var(--content-left) + 12px);
-  height: 100%;          /* the row fills the space the pinned panel leaves for it */
-  align-items: center;
+  height: 100%;
+  padding-left: calc(var(--content-left) + 12px);
   will-change: transform;
 }
+/* One copy of the cards. The gap after the last card is part of the copy (padding),
+   so two copies side by side are spaced exactly like the cards inside one. */
+.wset {
+  position: relative;
+  display: flex;
+  gap: 36px;
+  padding-right: 36px;
+  height: 100%;
+  align-items: center;
+}
+.wcard img, .wcard svg { -webkit-user-drag: none; pointer-events: none; }
 
 .wcard {
   --card-w: clamp(260px, 24vw, 340px);
@@ -441,10 +441,6 @@ main { position: relative; z-index: 1; }
 .works-progress__track { flex: 0 1 260px; height: 3px; background: rgba(243, 241, 238, 0.25); overflow: hidden; }
 .works-progress__fill { display: block; height: 100%; background: linear-gradient(90deg, var(--cyan), var(--pink)); transform-origin: left; transform: scaleX(0.02); }
 
-/* Reduced motion: no pinning, a normal row you scroll sideways. */
-.chapter--works.is-static .works-pin { position: static; height: auto; overflow: visible; padding-bottom: 80px; }
-.chapter--works.is-static .works-viewport { overflow-x: auto; scroll-snap-type: x mandatory; -webkit-mask-image: none; mask-image: none; }
-.chapter--works.is-static .wcard { scroll-snap-align: start; filter: none; }
 
 /* ============ Arsenal ============ */
 /* Slots start up to 180px off to the side before flying in; clip so they can't widen the page on phones.
@@ -957,7 +953,6 @@ main { position: relative; z-index: 1; }
   .origin__tagline { letter-spacing: 0.3em; }
   .origin__tagline { letter-spacing: 0.4em; font-size: 14px; }
   .origin__blurb { font-size: 17px; }
-  .works-pin { padding-top: 92px; }
   .wcard { --card-w: 72vw; --card-h: min(420px, calc(100% / 1.08)); }
   .wcard.is-hover { transform: translateY(-6px) scale(1.04); }
   .wcard__kind { font-size: 10px; letter-spacing: 0.1em; }
@@ -987,7 +982,6 @@ main { position: relative; z-index: 1; }
 
 /* Short screens (small laptops): a smaller heading leaves more room for the cards. */
 @media (max-height: 760px) {
-  .works-pin { padding-top: 92px; padding-bottom: 24px; }
   .chapter--works .chapter-title { font-size: clamp(56px, 7vw, 88px); }
   .chapter--works .kicker { font-size: 22px; }
 }

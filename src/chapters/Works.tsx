@@ -1,94 +1,196 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, type CSSProperties } from 'react';
 import { projects } from '../content';
 import { ProjectArt } from '../components/ProjectArt';
 import { ProjectDialog } from '../components/ProjectDialog';
 import { AllProjects } from '../components/AllProjects';
 import { scrollToChapter } from '../components/scroll';
 
-const MAX_CARDS = 7;   // more projects than this? The rest live behind "View more projects".
-const GLIDE = 10;      // how quickly the row catches up with your scroll (higher = snappier)
+const MAX_CARDS = 7;      // more projects than this? The rest live behind "View more projects".
+const DRIFT = 30;         // idle drift speed, px per second
+const RESUME_AFTER = 1800; // ms to wait after you drag/scroll before the drift eases back in
+const DRAG_START = 6;     // px the pointer must move before a press counts as a drag, not a click
 
 /**
- * Chapter 02: a pinned, horizontally scrolling row of project cards.
+ * Chapter 02: an endless row of project cards.
  *
- * How the pin works:
- *  - The <section> is made taller than the screen by exactly the row's extra width.
- *  - Inside it, `.works-pin` is `position: sticky; top: 0`, so it stays on screen
- *    while you scroll through that extra height.
- *  - Scrolling down by N pixels inside the section moves the row left by N pixels.
- *  - After the last card, the section ends and the page scrolls normally again.
+ * - The row drifts slowly left on its own (the idle animation).
+ * - Sideways trackpad swipes, Shift + wheel, mouse drags and finger swipes move it by hand.
+ *   A normal vertical wheel is left alone, so the page scrolls straight past.
+ * - The cards are drawn twice, back to back. When the first copy has slid fully out of
+ *   view we jump back by exactly one copy's width. The second copy is then exactly where
+ *   the first one was, so the jump is invisible and the row never runs out.
  */
 export function Works() {
   const [reduced] = useState(() => window.matchMedia('(prefers-reduced-motion: reduce)').matches);
-  const sectionRef = useRef<HTMLElement>(null);
   const viewportRef = useRef<HTMLDivElement>(null);
   const trackRef = useRef<HTMLDivElement>(null);
+  const setRef = useRef<HTMLDivElement>(null);
   const barRef = useRef<HTMLSpanElement>(null);
   const countRef = useRef<HTMLSpanElement>(null);
 
-  const [hovered, setHovered] = useState<number | null>(null);
+  const [hovered, setHovered] = useState<string | null>(null);   // "copy-index", e.g. "0-2"
+  const [focusInside, setFocusInside] = useState(false);
   const [open, setOpen] = useState<number | null>(null);          // index into projects
   const [showAll, setShowAll] = useState(false);
+  const [loops, setLoops] = useState(true);                        // false when every card fits on screen
 
   const shown = projects.slice(0, MAX_CARDS);
   const hasMore = projects.length > MAX_CARDS;
-  const geometry = useRef({ distance: 0, x: 0 });
+
+  // Everything the animation loop needs, kept in a ref so it never causes a re-render.
+  const motion = useRef({
+    x: 0,               // how far the row is shifted left (px, negative)
+    velocity: 0,        // leftover speed after a drag, px per second
+    wheel: 0,           // sideways wheel distance still to apply
+    speed: 0,           // current drift speed (eases towards its target)
+    lastTouched: -1e9,  // when the visitor last moved the row by hand
+    paused: false,      // hover, focus or an open popup
+    dragging: false,
+    dragged: false,     // the last press turned into a drag: swallow its click
+  });
+  // The animation loop reads `loops` without restarting.
+  const loopsRef = useRef(loops);
+  useEffect(() => { loopsRef.current = loops; }, [loops]);
+
+  const paused = hovered !== null || focusInside || open !== null || showAll;
+  useEffect(() => { motion.current.paused = paused; }, [paused]);
 
   useEffect(() => {
-    if (reduced) return;
-    const section = sectionRef.current!;
     const viewport = viewportRef.current!;
     const track = trackRef.current!;
-    const g = geometry.current;
+    const set = setRef.current!;
+    const m = motion.current;
+    let setWidth = 0;
 
-    // How far the row has to travel, and therefore how tall the section must be.
+    // One copy's width, including the gap after it. Loop only if the cards overflow the screen.
     const measure = () => {
-      g.distance = Math.max(0, track.scrollWidth - viewport.clientWidth);
-      section.style.height = `${window.innerHeight + g.distance}px`;
+      setWidth = set.offsetWidth;
+      setLoops(setWidth > viewport.clientWidth * 0.8);
     };
     measure();
     const ro = new ResizeObserver(measure);
-    ro.observe(track);
+    ro.observe(set);
     ro.observe(viewport);
-    window.addEventListener('resize', measure);
 
-    // 0 when the section's top reaches the top of the screen, 1 when the last card is in view.
-    const progress = () => {
-      if (g.distance === 0) return 0;
-      const top = section.getBoundingClientRect().top;
-      return Math.min(1, Math.max(0, -top / g.distance));
+    const touched = () => { m.lastTouched = performance.now(); };
+
+    // Sideways wheel/trackpad (or Shift + wheel). Vertical scrolling is left to the page.
+    const onWheel = (e: WheelEvent) => {
+      const dx = e.shiftKey && e.deltaX === 0 ? e.deltaY : e.deltaX;
+      if (Math.abs(dx) <= Math.abs(e.deltaY) && !e.shiftKey) return;
+      e.preventDefault();
+      m.wheel += dx;
+      touched();
     };
 
-    let last = performance.now();
+    // Drag with a mouse, or swipe with a finger.
+    let startX = 0, startRowX = 0, lastX = 0, lastT = 0, pointerId = -1;
+    const onDown = (e: PointerEvent) => {
+      if (e.button !== 0) return;
+      pointerId = e.pointerId;
+      startX = lastX = e.clientX;
+      startRowX = m.x;
+      lastT = performance.now();
+      m.dragged = false;
+      m.velocity = 0;
+    };
+    const onMove = (e: PointerEvent) => {
+      if (e.pointerId !== pointerId) return;
+      if (!m.dragging && Math.abs(e.clientX - startX) > DRAG_START) {
+        m.dragging = m.dragged = true;
+        viewport.setPointerCapture(e.pointerId);
+        viewport.classList.add('is-dragging');
+      }
+      if (!m.dragging) return;
+      const now = performance.now();
+      const dt = Math.max(1, now - lastT) / 1000;
+      m.velocity = 0.8 * ((e.clientX - lastX) / dt) + 0.2 * m.velocity;   // smoothed, for the fling
+      lastX = e.clientX;
+      lastT = now;
+      m.x = startRowX + (e.clientX - startX);
+      touched();
+    };
+    const onUp = (e: PointerEvent) => {
+      if (e.pointerId !== pointerId) return;
+      pointerId = -1;
+      if (m.dragging) {
+        m.dragging = false;
+        viewport.classList.remove('is-dragging');
+        if (performance.now() - lastT > 80) m.velocity = 0;   // paused before letting go: no fling
+        touched();
+      }
+    };
+    // A drag ends with a click on whatever card is under the pointer. Swallow that click.
+    const onClickCapture = (e: MouseEvent) => {
+      if (m.dragged) { e.preventDefault(); e.stopPropagation(); m.dragged = false; }
+    };
+
+    viewport.addEventListener('wheel', onWheel, { passive: false });
+    viewport.addEventListener('pointerdown', onDown);
+    viewport.addEventListener('pointermove', onMove);
+    viewport.addEventListener('pointerup', onUp);
+    viewport.addEventListener('pointercancel', onUp);
+    viewport.addEventListener('click', onClickCapture, true);
+
+    // The animation loop only runs while Works is on screen.
     let frame = 0;
+    let last = performance.now();
+    const cards = () => set.querySelectorAll<HTMLElement>('.wcard:not(.wcard--more)');
     const loop = (now: number) => {
       const dt = Math.min(0.05, (now - last) / 1000);
       last = now;
-      const p = progress();
-      const target = -p * g.distance;
-      // Ease towards the target so wheel "steps" turn into a smooth glide.
-      g.x += (target - g.x) * (1 - Math.exp(-dt * GLIDE));
-      if (Math.abs(target - g.x) < 0.1) g.x = target;
-      track.style.transform = `translate3d(${g.x}px, 0, 0)`;
 
-      if (barRef.current) barRef.current.style.transform = `scaleX(${Math.max(0.02, p)})`;
-      if (countRef.current) {
-        // Count the cards you've seen: those whose middle has come into view.
-        const rightEdge = -g.x + viewport.clientWidth;
-        const cards = track.querySelectorAll<HTMLElement>('.wcard:not(.wcard--more)');
-        let seen = 0;
-        cards.forEach((c) => { if (c.offsetLeft + c.offsetWidth / 2 < rightEdge) seen++; });
-        countRef.current.textContent = `${String(Math.max(1, seen)).padStart(2, '0')} / ${String(shown.length).padStart(2, '0')}`;
+      // Drift: full speed when idle, easing to a stop on hover/focus and just after you touch it.
+      const idle = !m.paused && !m.dragging && now - m.lastTouched > RESUME_AFTER;
+      const target = !reduced && idle ? DRIFT : 0;
+      m.speed += (target - m.speed) * (1 - Math.exp(-dt * 2.5));
+
+      if (!m.dragging) {
+        m.x -= m.speed * dt;
+        m.x += m.velocity * dt;                         // fling after a drag...
+        m.velocity *= Math.exp(-dt * 4);                // ...slowing down like friction
+        const step = m.wheel * (1 - Math.exp(-dt * 14)); // wheel steps become a glide
+        m.x -= step;
+        m.wheel -= step;
+      }
+
+      if (setWidth > 0 && loopsRef.current) {
+        // Keep x within one copy's width; the second copy makes the wrap invisible.
+        m.x = ((m.x % setWidth) - setWidth) % setWidth;
+      } else {
+        m.x = Math.min(0, Math.max(m.x, viewport.clientWidth - track.scrollWidth));
+      }
+      track.style.transform = `translate3d(${m.x}px, 0, 0)`;
+
+      // Progress: how far through one lap, and which card is at the left edge.
+      if (setWidth > 0) {
+        const lap = -m.x / setWidth;
+        if (barRef.current) barRef.current.style.transform = `scaleX(${Math.max(0.02, lap)})`;
+        if (countRef.current) {
+          let idx = 0;
+          cards().forEach((c, i) => { if (c.offsetLeft + c.offsetWidth / 2 < -m.x) idx = i + 1; });
+          const n = shown.length;
+          countRef.current.textContent = `${String((idx % n) + 1).padStart(2, '0')} / ${String(n).padStart(2, '0')}`;
+        }
       }
       frame = requestAnimationFrame(loop);
     };
-    frame = requestAnimationFrame(loop);
+    const io = new IntersectionObserver(([e]) => {
+      cancelAnimationFrame(frame);
+      if (e.isIntersecting) { last = performance.now(); frame = requestAnimationFrame(loop); }
+    });
+    io.observe(viewport);
 
     return () => {
       cancelAnimationFrame(frame);
+      io.disconnect();
       ro.disconnect();
-      window.removeEventListener('resize', measure);
-      section.style.height = '';
+      viewport.removeEventListener('wheel', onWheel);
+      viewport.removeEventListener('pointerdown', onDown);
+      viewport.removeEventListener('pointermove', onMove);
+      viewport.removeEventListener('pointerup', onUp);
+      viewport.removeEventListener('pointercancel', onUp);
+      viewport.removeEventListener('click', onClickCapture, true);
     };
   }, [reduced, shown.length]);
 
@@ -105,90 +207,98 @@ export function Works() {
     return () => window.removeEventListener('open-project', onOpen);
   }, []);
 
-  // Keyboard: tabbing to a card scrolls the page so that card is in the middle.
+  // Keyboard: tabbing to a card slides the row so that card sits at the left edge.
   const bringIntoView = (el: HTMLElement) => {
-    const g = geometry.current;
-    const section = sectionRef.current;
-    const viewport = viewportRef.current;
-    if (reduced || !section || !viewport || g.distance === 0) return;
-    const wanted = el.offsetLeft - (viewport.clientWidth - el.offsetWidth) / 2;
-    const p = Math.min(1, Math.max(0, wanted / g.distance));
-    const sectionTop = section.getBoundingClientRect().top + window.scrollY;
-    window.scrollTo({ top: sectionTop + p * g.distance });
+    motion.current.x = -el.offsetLeft;
+    motion.current.wheel = 0;
+    motion.current.velocity = 0;
   };
 
-  return (
-    <section
-      id="works"
-      ref={sectionRef}
-      className={`chapter chapter--works${reduced ? ' is-static' : ''}`}
-      aria-labelledby="works-title"
+  // One copy of the row. The second copy is only there for the seamless loop:
+  // hidden from screen readers and the keyboard (`inert`).
+  const renderSet = (copy: number) => (
+    <div
+      ref={copy === 0 ? setRef : undefined}
+      className="wset"
+      aria-hidden={copy === 1 || undefined}
+      inert={copy === 1 || undefined}
     >
-      <div className="works-pin">
-        <div className="chapter-head">
-          <div>
-            <span className="kicker">CHAPTER 02</span>
-            <h2 id="works-title" className="chapter-title">WORKS</h2>
-          </div>
-          <p className="works__hints">
-            <span className="hint-mouse"><b className="t-cream">SCROLL</b> TO BROWSE</span>
-            <span className="hint-mouse"><b className="t-pink">HOVER</b> TO FOCUS</span>
-            <span className="hint-mouse"><b className="t-cyan">CLICK</b> TO OPEN</span>
-            <span className="hint-touch"><b className="t-cream">SWIPE UP</b> TO BROWSE</span>
-            <span className="hint-touch"><b className="t-cyan">TAP</b> TO OPEN</span>
-          </p>
+      {shown.map((p, i) => {
+        const key = `${copy}-${i}`;
+        return (
+          <button
+            key={p.num}
+            type="button"
+            className={`wcard${hovered === key ? ' is-hover' : ''}`}
+            style={{ '--accent': p.accent } as CSSProperties}
+            onPointerEnter={(e) => { if (e.pointerType === 'mouse') setHovered(key); }}
+            onPointerLeave={() => setHovered((h) => (h === key ? null : h))}
+            onFocus={(e) => { setHovered(key); bringIntoView(e.currentTarget); }}
+            onBlur={() => setHovered((h) => (h === key ? null : h))}
+            onClick={() => setOpen(i)}
+            aria-haspopup="dialog"
+          >
+            <span className="wcard__art"><ProjectArt num={p.num} /></span>
+            <span className="wcard__body">
+              <span className="wcard__top">
+                <span className="wcard__num">{p.num}</span>
+                <span className="wcard__kind">{p.kind}</span>
+              </span>
+              <span className="wcard__title">{p.title}</span>
+              <span className="wcard__tagline">{p.tagline}</span>
+              <span className="wcard__stack">{p.stack.slice(0, 3).join(' · ')}</span>
+            </span>
+          </button>
+        );
+      })}
+
+      {hasMore && (
+        <button
+          type="button"
+          className="wcard wcard--more"
+          onClick={() => setShowAll(true)}
+          onFocus={(e) => bringIntoView(e.currentTarget)}
+          aria-haspopup="dialog"
+        >
+          <span className="wcard-more__count">+{projects.length - MAX_CARDS}</span>
+          <span className="wcard-more__label">VIEW MORE PROJECTS</span>
+          <span className="wcard-more__arrow" aria-hidden="true">→</span>
+        </button>
+      )}
+    </div>
+  );
+
+  return (
+    <section id="works" className="chapter chapter--works" aria-labelledby="works-title">
+      <div className="chapter-head">
+        <div>
+          <span className="kicker">CHAPTER 02</span>
+          <h2 id="works-title" className="chapter-title">WORKS</h2>
         </div>
+        <p className="works__hints">
+          <span className="hint-mouse"><b className="t-cream">DRAG</b> OR <b className="t-cream">SHIFT + SCROLL</b></span>
+          <span className="hint-mouse"><b className="t-pink">HOVER</b> TO FOCUS</span>
+          <span className="hint-mouse"><b className="t-cyan">CLICK</b> TO OPEN</span>
+          <span className="hint-touch"><b className="t-cream">SWIPE</b> TO BROWSE</span>
+          <span className="hint-touch"><b className="t-cyan">TAP</b> TO OPEN</span>
+        </p>
+      </div>
 
-        <div ref={viewportRef} className={`works-viewport${hovered !== null ? ' has-hover' : ''}`}>
-          <div ref={trackRef} className="wtrack">
-            {shown.map((p, i) => (
-              <button
-                key={p.num}
-                type="button"
-                className={`wcard${hovered === i ? ' is-hover' : ''}`}
-                style={{ '--accent': p.accent } as React.CSSProperties}
-                onPointerEnter={(e) => { if (e.pointerType === 'mouse') setHovered(i); }}
-                onPointerLeave={() => setHovered((h) => (h === i ? null : h))}
-                onFocus={(e) => { setHovered(i); bringIntoView(e.currentTarget); }}
-                onBlur={() => setHovered((h) => (h === i ? null : h))}
-                onClick={() => setOpen(i)}
-                aria-haspopup="dialog"
-              >
-                <span className="wcard__art"><ProjectArt num={p.num} /></span>
-                <span className="wcard__body">
-                  <span className="wcard__top">
-                    <span className="wcard__num">{p.num}</span>
-                    <span className="wcard__kind">{p.kind}</span>
-                  </span>
-                  <span className="wcard__title">{p.title}</span>
-                  <span className="wcard__tagline">{p.tagline}</span>
-                  <span className="wcard__stack">{p.stack.slice(0, 3).join(' · ')}</span>
-                </span>
-              </button>
-            ))}
-
-            {hasMore && (
-              <button
-                type="button"
-                className="wcard wcard--more"
-                onClick={() => setShowAll(true)}
-                onFocus={(e) => bringIntoView(e.currentTarget)}
-                aria-haspopup="dialog"
-              >
-                <span className="wcard-more__count">+{projects.length - MAX_CARDS}</span>
-                <span className="wcard-more__label">VIEW MORE PROJECTS</span>
-                <span className="wcard-more__arrow" aria-hidden="true">→</span>
-              </button>
-            )}
-          </div>
+      <div
+        ref={viewportRef}
+        className={`works-viewport${hovered !== null ? ' has-hover' : ''}`}
+        onFocus={() => setFocusInside(true)}
+        onBlur={(e) => { if (!e.currentTarget.contains(e.relatedTarget as Node)) setFocusInside(false); }}
+      >
+        <div ref={trackRef} className="wtrack">
+          {renderSet(0)}
+          {loops && renderSet(1)}
         </div>
+      </div>
 
-        {!reduced && (
-          <div className="works-progress" aria-hidden="true">
-            <span ref={countRef} className="works-progress__count">01 / {String(shown.length).padStart(2, '0')}</span>
-            <span className="works-progress__track"><span ref={barRef} className="works-progress__fill" /></span>
-          </div>
-        )}
+      <div className="works-progress" aria-hidden="true">
+        <span ref={countRef} className="works-progress__count">01 / {String(shown.length).padStart(2, '0')}</span>
+        <span className="works-progress__track"><span ref={barRef} className="works-progress__fill" /></span>
       </div>
 
       {showAll && (
